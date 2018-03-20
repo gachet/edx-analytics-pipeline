@@ -6,7 +6,13 @@ import logging
 import re
 
 import luigi
+try:
+    from google.cloud.bigquery import SchemaField
+    bigquery_available = True  # pylint: disable=invalid-name
+except ImportError:
+    bigquery_available = False  # pylint: disable=invalid-name
 
+from edx.analytics.tasks.common.bigquery_load import BigQueryLoadDownstreamMixin, BigQueryLoadTask
 from edx.analytics.tasks.common.mysql_load import get_mysql_query_results
 from edx.analytics.tasks.common.sqoop import SqoopImportFromMysql
 from edx.analytics.tasks.common.vertica_load import SchemaManagementTask, VerticaCopyTask
@@ -16,7 +22,7 @@ from edx.analytics.tasks.util.url import ExternalURL, url_path_join
 log = logging.getLogger(__name__)
 
 
-class MysqlToVerticaTaskMixin(WarehouseMixin):
+class MysqlToWarehouseTaskMixin(WarehouseMixin):
     """
     Parameters for importing a mysql database into the warehouse.
     """
@@ -30,7 +36,7 @@ class MysqlToVerticaTaskMixin(WarehouseMixin):
     )
 
 
-class LoadMysqlToVerticaTableTask(MysqlToVerticaTaskMixin, VerticaCopyTask):
+class LoadMysqlToVerticaTableTask(MysqlToWarehouseTaskMixin, VerticaCopyTask):
     """
     Task to import a table from mysql into vertica.
     """
@@ -188,7 +194,7 @@ class PostImportDatabaseTask(SchemaManagementTask):
         )
 
 
-class ImportMysqlToVerticaTask(MysqlToVerticaTaskMixin, luigi.WrapperTask):
+class ImportMysqlToVerticaTask(MysqlToWarehouseTaskMixin, luigi.WrapperTask):
     """Provides entry point for importing a mysql database into Vertica."""
 
     schema = luigi.Parameter(
@@ -267,3 +273,162 @@ class ImportMysqlToVerticaTask(MysqlToVerticaTaskMixin, luigi.WrapperTask):
 
     def complete(self):
         return self.is_complete
+
+
+class LoadMysqlToBigQueryTableTask(MysqlToWarehouseTaskMixin, BigQueryLoadTask):
+    """
+    Task to import a table from MySQL into BigQuery.
+    """
+
+    table_name = luigi.Parameter(
+        description='The name of the table.',
+    )
+
+    date = luigi.DateParameter(
+        default=datetime.datetime.utcnow().date(),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super(LoadMysqlToBigQueryTableTask, self).__init__(*args, **kwargs)
+        self.table_schema = []
+
+    def requires(self):
+        if self.required_tasks is None:
+            self.required_tasks = {
+                'credentials': ExternalURL(url=self.credentials),
+                'insert_source': self.insert_source_task,
+            }
+        return self.required_tasks
+
+    def get_bigquery_schema(self):
+        """Transforms mysql table schema into a vertica compliant schema."""
+
+        if not self.table_schema:
+            results = get_mysql_query_results(self.db_credentials, self.database, 'describe {}'.format(self.table_name))
+            for result in results:
+                field_name = result[0].strip()
+                field_type = result[1].strip()
+                field_null = result[2].strip()
+
+                # Accepted types for standard tables are 'STRING', 'INT64', 'FLOAT64', 'BOOL', 'TIMESTAMP', 'BYTES', 'DATE', 'TIME', 'DATETIME'.
+                
+                types_with_parentheses = ['tinyint', 'smallint', 'int', 'bigint', 'datetime']
+                if any(_type in field_type for _type in types_with_parentheses):
+                    field_type = field_type.rsplit('(')[0]
+                elif field_type == 'longtext':
+                    field_type = 'LONG VARCHAR'
+                elif field_type == 'longblob':
+                    field_type = 'LONG VARBINARY'
+                elif field_type == 'double':
+                    field_type = 'DOUBLE PRECISION'
+
+                bigquery_type = field_type
+                mode = 'REQUIRED' if field_null == 'NO' else 'NULLABLE'
+                description = ''
+                
+                self.table_schema.append(SchemaField(field_name, bigquery_type, description=description, mode=mode))
+                
+        return self.table_schema
+
+    @property
+    def copy_delimiter(self):
+        """The delimiter in the data to be copied."""
+        return "','"
+
+    @property
+    def copy_null_sequence(self):
+        """The null sequence in the data to be copied."""
+        return "'NULL'"
+
+    @property
+    def enclosed_by(self):
+        return "''''"
+
+    @property
+    def insert_source_task(self):
+        # Use the same source for BigQuery loads as was used for Vertica loads.
+        partition_path_spec = HivePartition('dt', self.date.isoformat()).path_spec
+        destination = url_path_join(
+            self.warehouse_path,
+            "database_import",
+            self.database,
+            self.table_name,
+            partition_path_spec
+        ) + '/'
+        return SqoopImportFromMysql(
+            table_name=self.table_name,
+            credentials=self.db_credentials,
+            database=self.database,
+            destination=destination,
+            overwrite=self.overwrite,
+            mysql_delimiters=True,
+        )
+
+    @property
+    def table(self):
+        return self.table_name
+
+    @property
+    def schema(self):
+        return self.get_bigquery_schema()
+
+
+class ImportMysqlToBigQueryTask(MysqlToWarehouseTaskMixin, BigQueryLoadDownstreamMixin, luigi.WrapperTask):
+    """Provides entry point for importing a mysql database into BigQuery."""
+
+    date = luigi.DateParameter(
+        default=datetime.datetime.utcnow().date(),
+    )
+    exclude = luigi.ListParameter(
+        default=(),
+    )
+
+    def __init__(self, *args, **kwargs):
+        super(ImportMysqlToBigQueryTask, self).__init__(*args, **kwargs)
+        self.table_list = []
+        self.is_complete = False
+
+    def should_exclude_table(self, table_name):
+        """Determines whether to exclude a table during the import."""
+        if any(re.match(pattern, table_name) for pattern in self.exclude):
+            return True
+        return False
+
+    def run(self):
+        # Add yields of tasks in run() method, to serve as dynamic dependencies.
+        # This method should be rerun each time it yields a job.
+        if not self.table_list:
+            results = get_mysql_query_results(self.db_credentials, self.database, 'show tables')
+            # TODO:  we should apply the exclusion here, so that table_list doesn't include them.
+            self.table_list = [result[0].strip() for result in results]
+
+        for table_name in self.table_list:
+            if not self.should_exclude_table(table_name):
+                yield LoadMysqlToBigQueryTableTask(
+                    db_credentials=self.db_credentials,
+                    database=self.database,
+                    warehouse_path=self.warehouse_path,
+                    table_name=table_name,
+                    overwrite=self.overwrite,
+                    date=self.date,
+                    dataset_id=self.dataset_id,
+                    credentials=self.credentials,
+                    max_bad_records=self.max_bad_records,
+                )
+
+        self.is_complete = True
+
+    def complete(self):
+        return self.is_complete
+
+    # This is what event export uses.  We could switch to this if we don't use
+    # dynamic dependencies for this.   And why would we not?
+    # Perhaps because we don't want th query to Mysql to happen that early?
+    # If so, then replace the run() with the requires(), and then use these:
+    
+    # def output(self):
+    #     return [task.output() for task in self.requires()]
+
+    # def complete(self):
+    #     # OverwriteOutputMixin changes the complete() method behavior, so we override it.
+    #     return all(r.complete() for r in luigi.task.flatten(self.requires()))
