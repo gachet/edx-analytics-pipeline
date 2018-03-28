@@ -292,13 +292,49 @@ class LoadMysqlToBigQueryTableTask(MysqlToWarehouseTaskMixin, BigQueryLoadTask):
         super(LoadMysqlToBigQueryTableTask, self).__init__(*args, **kwargs)
         self.table_schema = []
 
-    def requires(self):
-        if self.required_tasks is None:
-            self.required_tasks = {
-                'credentials': ExternalURL(url=self.credentials),
-                'insert_source': self.insert_source_task,
-            }
-        return self.required_tasks
+    # Accepted types for standard tables are 'STRING', 'INT64', 'FLOAT64', 'BOOL', 'TIMESTAMP', 'BYTES', 'DATE', 'TIME', 'DATETIME'.
+    MYSQL_TO_BIGQUERY_TYPE_MAP = {
+        # STRING -- BQ assumes input is utf8.   Loading will fail if the string data being loaded is not utf8.
+        'varchar': 'STRING',
+        'char': 'STRING',
+        'longtext': 'STRING',
+        # INT64
+        'smallint': 'INT64',
+        'mediumint': 'INT64',
+        'int': 'INT64',
+        'integer': 'INT64',
+        'bigint': 'INT64',
+        # FLOAT64
+        'dec': 'FLOAT64',
+        'decimal': 'FLOAT64',
+        'float': 'FLOAT64',
+        'double': 'FLOAT64',
+        'double precision': 'FLOAT64',
+        'real': 'FLOAT64',
+        'number': 'FLOAT64',
+        'numeric': 'FLOAT64',
+        # BOOL
+        'tinyint': 'BOOL',
+        'bool': 'BOOL',
+        'boolean': 'BOOL',
+        # TIMESTAMP -- like DATETIME, but with timezone
+        'timestamp': 'TIMESTAMP',
+        # BYTES
+        'binary': 'BYTES',
+        'varbinary': 'BYTES',
+        'tinyblob': 'BYTES',
+        'blob': 'BYTES',
+        'clob': 'BYTES',
+        'byte': 'BYTES',
+        'mediumblob': 'BYTES',
+        'longblob': 'BYTES',
+        # DATE
+        'date': 'DATE',
+        # TIME
+        'time': 'TIME',
+        # DATETIME
+        'datetime': 'DATETIME',
+    }
 
     def get_bigquery_schema(self):
         """Transforms mysql table schema into a vertica compliant schema."""
@@ -310,19 +346,12 @@ class LoadMysqlToBigQueryTableTask(MysqlToWarehouseTaskMixin, BigQueryLoadTask):
                 field_type = result[1].strip()
                 field_null = result[2].strip()
 
-                # Accepted types for standard tables are 'STRING', 'INT64', 'FLOAT64', 'BOOL', 'TIMESTAMP', 'BYTES', 'DATE', 'TIME', 'DATETIME'.
-                
-                types_with_parentheses = ['tinyint', 'smallint', 'int', 'bigint', 'datetime']
-                if any(_type in field_type for _type in types_with_parentheses):
-                    field_type = field_type.rsplit('(')[0]
-                elif field_type == 'longtext':
-                    field_type = 'LONG VARCHAR'
-                elif field_type == 'longblob':
-                    field_type = 'LONG VARBINARY'
-                elif field_type == 'double':
-                    field_type = 'DOUBLE PRECISION'
+                # types_with_parentheses = ['tinyint', 'smallint', 'int', 'bigint', 'datetime', 'varchar']
+                # if any(_type in field_type for _type in types_with_parentheses):
+                # Strip off size information from any type.
+                field_type = field_type.rsplit('(')[0]
 
-                bigquery_type = field_type
+                bigquery_type = self.MYSQL_TO_BIGQUERY_TYPE_MAP.get(field_type)
                 mode = 'REQUIRED' if field_null == 'NO' else 'NULLABLE'
                 description = ''
                 
@@ -331,18 +360,18 @@ class LoadMysqlToBigQueryTableTask(MysqlToWarehouseTaskMixin, BigQueryLoadTask):
         return self.table_schema
 
     @property
-    def copy_delimiter(self):
+    def field_delimiter(self):
         """The delimiter in the data to be copied."""
-        return "','"
+        return ","
 
     @property
-    def copy_null_sequence(self):
+    def null_marker(self):
         """The null sequence in the data to be copied."""
-        return "'NULL'"
+        return "NULL"
 
     @property
-    def enclosed_by(self):
-        return "''''"
+    def quote_character(self):
+        return "\'"
 
     @property
     def insert_source_task(self):
