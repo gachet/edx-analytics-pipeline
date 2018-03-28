@@ -257,6 +257,11 @@ class BigQueryLoadTask(BigQueryLoadDownstreamMixin, luigi.Task):
         else:
             log.debug(" ".join(['gsutil', '-m', 'rsync', source_path, destination_path]))
             return_code = subprocess.call(['gsutil', '-m', 'rsync', source_path, destination_path])
+            if return_code == 0:
+                # Remove any files that were copied whose names have leading underscores.
+                underscore_path = url_path_join(destination_path, '_*')
+                log.debug(" ".join(['gsutil', 'rm', underscore_path]))
+                return_code = subprocess.call(['gsutil', 'rm', underscore_path])
 
         if return_code != 0:
             raise RuntimeError('Error while syncing {source} to {destination}'.format(
